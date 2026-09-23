@@ -95,6 +95,7 @@ class KeyRing:
         self._now = now or (lambda: int(time.time()))
         self._lock = threading.Lock()
         self._keys: dict[str, KeyPair] = {}
+        self._retired: set[str] = set()
         self._current_id: str = ""
         self.rotate()
 
@@ -104,6 +105,9 @@ class KeyRing:
 
     def rotate(self) -> KeyPair:
         with self._lock:
+            if self._current_id:
+                # 旧密钥进入退役集合：仍可验签，但签发的令牌一律视为失效
+                self._retired.add(self._current_id)
             key = KeyPair(
                 key_id=secrets.token_hex(8),
                 secret=secrets.token_bytes(32),
@@ -116,6 +120,10 @@ class KeyRing:
     def get(self, key_id: str) -> KeyPair | None:
         with self._lock:
             return self._keys.get(key_id)
+
+    def is_retired(self, key_id: str) -> bool:
+        with self._lock:
+            return key_id in self._retired
 
 
 class TokenCodec:

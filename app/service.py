@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -44,9 +43,6 @@ class AuthService:
         self.sessions = SessionStore()
         self.roles = RoleStore()
         self.authorizer = Authorizer(self.roles)
-        self._lock = threading.Lock()
-        # 密钥轮换时间阈值：早于该时间签发的令牌一律失效
-        self._valid_after = 0
 
     # ---- 内部 helpers -------------------------------------------------
 
@@ -67,9 +63,8 @@ class AuthService:
         return TokenPair(access, refresh, session_id)
 
     def _check_rotation_cutoff(self, payload: TokenPayload) -> None:
-        with self._lock:
-            valid_after = self._valid_after
-        if payload.issued_at < valid_after:
+        # 以退役密钥集合判定，避免时钟秒级粒度造成的边界歧义
+        if self.keyring.is_retired(payload.key_id):
             raise AuthError(DenyReason.TOKEN_REVOKED, "签名密钥已轮换，令牌失效")
 
     # ---- 公开操作 ------------------------------------------------------
@@ -102,8 +97,6 @@ class AuthService:
 
     def rotate_keys(self) -> None:
         self.keyring.rotate()
-        with self._lock:
-            self._valid_after = self._now()
 
     def authorize(self, access_token: str, permission: Permission,
                   resource_id: str | None = None) -> str:
