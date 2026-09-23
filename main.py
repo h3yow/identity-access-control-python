@@ -1,8 +1,6 @@
-from fastapi import FastAPI
+"""服务入口：uvicorn main:app"""
 
-app = FastAPI()
+from auth.app import build_default_service, create_app
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+service = build_default_service()
+app = create_app(service)
