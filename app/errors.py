@@ -13,6 +13,7 @@ class DenyReason(str, enum.Enum):
     TOKEN_REVOKED = "token_revoked"                # 会话已撤销 / 密钥轮换后失效
     REFRESH_REUSED = "refresh_token_reused"        # 刷新令牌重放（会话族已撤销）
     SESSION_NOT_FOUND = "session_not_found"        # 会话不存在
+    SESSION_LIMIT_REACHED = "session_limit_reached"  # 并发会话数达上限，登录被拒绝
     FORBIDDEN = "forbidden"                        # 已通过认证但无权限
     RESOURCE_NOT_FOUND = "resource_not_found"      # 资源不存在（仅授权通过后可见）
 

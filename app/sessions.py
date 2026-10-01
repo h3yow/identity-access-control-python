@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import enum
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 
@@ -44,25 +45,91 @@ class Session:
     status: SessionStatus = SessionStatus.ACTIVE
     current_generation: int = 0
     refresh_tokens: dict[str, RefreshRecord] = field(default_factory=dict)
+    device: str = ""
+    created_at: int = 0
+    last_refreshed_at: int = 0
 
 
 class SessionStore:
-    """线程安全的会话存储：轮换、撤销、重放检测。"""
+    """线程安全的会话存储：轮换、撤销、重放检测、并发容量限制。"""
 
-    def __init__(self) -> None:
+    def __init__(self, max_sessions_per_subject: int = 5, now=None) -> None:
         self._lock = threading.Lock()
         self._sessions: dict[str, Session] = {}
+        self._max_sessions_per_subject = max_sessions_per_subject
+        self._now = now or (lambda: int(time.time()))
 
-    def create(self, subject: str, token_id: str) -> Session:
+    def create(self, subject: str, token_id: str, device: str = "") -> Session:
+        """在单把锁内完成"容量检查 -> 建会话"，达到上限时不创建任何状态。
+
+        因此并发登录下：有效会话数绝不超过上限，被拒登录不会留下会话或令牌。
+        """
+        now = self._now()
         with self._lock:
+            active = [
+                s for s in self._sessions.values()
+                if s.subject == subject and s.status is SessionStatus.ACTIVE
+            ]
+            if len(active) >= self._max_sessions_per_subject:
+                raise AuthError(
+                    DenyReason.SESSION_LIMIT_REACHED,
+                    f"用户 {subject} 的并发会话已达上限 "
+                    f"{self._max_sessions_per_subject}",
+                )
+            ts = now
             session = Session(
                 session_id=uuid.uuid4().hex,
                 family_id=uuid.uuid4().hex,
                 subject=subject,
+                device=device,
+                created_at=ts,
+                last_refreshed_at=ts,
             )
             session.refresh_tokens[token_id] = RefreshRecord(token_id, generation=0)
             self._sessions[session.session_id] = session
             return session
+
+    def list_active(self, subject: str) -> list[Session]:
+        """返回该主体当前仍有效的会话，按创建时间升序（稳定）。"""
+        with self._lock:
+            return sorted(
+                (s for s in self._sessions.values()
+                 if s.subject == subject and s.status is SessionStatus.ACTIVE),
+                key=lambda s: (s.created_at, s.session_id),
+            )
+
+    def revoke_owned(self, session_id: str, subject: str) -> Session:
+        """撤销属于该 subject 的有效会话。
+
+        非属主 / 不存在一律按 SESSION_NOT_FOUND 拒绝（不泄漏他人会话是否存在）；
+        非 ACTIVE 状态走 _require_active 给出可区分原因。
+        """
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None or session.subject != subject:
+                raise AuthError(DenyReason.SESSION_NOT_FOUND, "会话不存在")
+            self._require_active(session)
+            session.status = SessionStatus.REVOKED
+            return session
+
+    def revoke_others(self, subject: str, keep_session_id: str) -> list[str]:
+        """撤销 subject 除 keep_session_id 外的全部有效会话，返回被撤销的会话标识。
+
+        保留的当前会话不会被误撤销；当前会话不存在/非属主时抛 SESSION_NOT_FOUND。
+        """
+        with self._lock:
+            keep = self._sessions.get(keep_session_id)
+            if keep is None or keep.subject != subject:
+                raise AuthError(DenyReason.SESSION_NOT_FOUND, "当前会话不存在")
+            self._require_active(keep)
+            revoked: list[str] = []
+            for s in self._sessions.values():
+                if (s.subject == subject and s.session_id != keep_session_id
+                        and s.status is SessionStatus.ACTIVE):
+                    s.status = SessionStatus.REVOKED
+                    revoked.append(s.session_id)
+            return sorted(revoked)
+
 
     def _require_active(self, session: Session | None) -> Session:
         if session is None:
@@ -90,6 +157,7 @@ class SessionStore:
             session.refresh_tokens[new_token_id] = RefreshRecord(
                 new_token_id, generation=session.current_generation
             )
+            session.last_refreshed_at = self._now()
             return session
 
     def get(self, session_id: str) -> Session | None:
