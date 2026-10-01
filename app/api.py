@@ -4,14 +4,16 @@
 - 401 token_malformed / token_expired / token_revoked / refresh_token_reused / session_not_found
 - 403 forbidden（已认证但无权限，不泄漏资源存在性）
 - 404 resource_not_found（授权通过但资源不存在）
+- 409 session_limit_reached（并发会话数达到上限，明确拒绝、不挤掉旧会话）
 """
 
 from __future__ import annotations
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from .audit import AuditAction
 from .authz import Permission
 from .errors import AuthError, DenyReason
 from .service import AuthService
@@ -22,6 +24,7 @@ _STATUS = {
     DenyReason.TOKEN_REVOKED: 401,
     DenyReason.REFRESH_REUSED: 401,
     DenyReason.SESSION_NOT_FOUND: 401,
+    DenyReason.SESSION_LIMIT_REACHED: 409,
     DenyReason.FORBIDDEN: 403,
     DenyReason.RESOURCE_NOT_FOUND: 404,
 }
@@ -30,6 +33,7 @@ _STATUS = {
 class LoginRequest(BaseModel):
     subject: str
     roles: list[str] = []
+    device_label: str = ""
 
 
 class RefreshRequest(BaseModel):
@@ -64,7 +68,7 @@ def create_app(service: AuthService | None = None) -> FastAPI:
 
     @app.post("/login")
     def login(body: LoginRequest) -> dict:
-        pair = svc.login(body.subject, body.roles)
+        pair = svc.login(body.subject, body.roles, body.device_label)
         return {
             "access_token": pair.access_token,
             "refresh_token": pair.refresh_token,
@@ -85,11 +89,72 @@ def create_app(service: AuthService | None = None) -> FastAPI:
         svc.logout(token)
         return {"status": "logged_out"}
 
+    # ---- 自助会话管理（任何已登录用户，只能操作自己的会话）-------------
+
+    @app.get("/sessions")
+    def list_sessions(token: str = Depends(bearer_token)) -> dict:
+        subject, _ = svc.active_session(token)
+        infos = svc.list_sessions(subject)
+        return {"sessions": [i.to_dict() for i in infos]}
+
+    @app.post("/sessions/revoke-others")
+    def revoke_others(token: str = Depends(bearer_token)) -> dict:
+        subject, current_session_id = svc.active_session(token)
+        # 固定保留当前会话：当前会话不可能被误撤销
+        revoked = svc.revoke_other_sessions(subject, current_session_id)
+        return {
+            "status": "revoked",
+            "kept": current_session_id,
+            "revoked": [i.to_dict() for i in revoked],
+        }
+
     @app.post("/sessions/{session_id}/revoke")
     def revoke(session_id: str, token: str = Depends(bearer_token)) -> dict:
-        svc.authorize(token, Permission("session", "revoke"))
-        svc.revoke_session(session_id)
-        return {"status": "revoked", "session_id": session_id}
+        subject, _ = svc.active_session(token)
+        # 归属校验在服务层：他人会话 forbidden，会话不存在 401
+        info = svc.revoke_owned_session(subject, session_id)
+        return {"status": "revoked", "session": info.to_dict()}
+
+    # ---- 会话安全审计 --------------------------------------------------
+
+    @app.get("/audit")
+    def query_audit(
+        token: str = Depends(bearer_token),
+        subject: str | None = None,
+        action: list[str] | None = Query(default=None),
+        start: int | None = None,
+        end: int | None = None,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> dict:
+        requester, _ = svc.active_session(token)
+        actions = None
+        if action:
+            try:
+                actions = {AuditAction(a) for a in action}
+            except ValueError as exc:
+                raise AuthError(DenyReason.TOKEN_MALFORMED, f"未知审计动作: {exc}") from exc
+        page = svc.query_audit(
+            requester, subject=subject, actions=actions,
+            start=start, end=end, offset=offset, limit=limit,
+        )
+        return {
+            "items": [
+                {
+                    "seq": r.seq,
+                    "timestamp": r.timestamp,
+                    "subject": r.subject,
+                    "action": r.action.value,
+                    "result": r.result,
+                    "session_id": r.session_id,
+                    "detail": r.detail,
+                }
+                for r in page.items
+            ],
+            "total": page.total,
+            "offset": page.offset,
+            "limit": page.limit,
+        }
 
     @app.post("/keys/rotate")
     def rotate_keys(token: str = Depends(bearer_token)) -> dict:
@@ -101,7 +166,7 @@ def create_app(service: AuthService | None = None) -> FastAPI:
     def set_role_permissions(role: str, body: RolePermissionsRequest,
                              token: str = Depends(bearer_token)) -> dict:
         svc.authorize(token, Permission("role", "manage"))
-        svc.roles.set_role_permissions(role, {Permission.parse(p) for p in body.permissions})
+        svc.set_role_permissions(role, {Permission.parse(p) for p in body.permissions})
         return {"status": "updated", "role": role}
 
     @app.get("/resources/{resource_id}")
