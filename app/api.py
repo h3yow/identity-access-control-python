@@ -5,6 +5,7 @@
 - 403 forbidden（已认证但无权限，不泄漏资源存在性）
 - 404 resource_not_found（授权通过但资源不存在）
 - 409 session_limit_reached（并发会话数达到上限，明确拒绝、不挤掉旧会话）
+- 409 current_session_revoke_denied（不允许撤销当前会话，拒绝后无任何副作用）
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ _STATUS = {
     DenyReason.REFRESH_REUSED: 401,
     DenyReason.SESSION_NOT_FOUND: 401,
     DenyReason.SESSION_LIMIT_REACHED: 409,
+    DenyReason.CURRENT_SESSION_REVOKE_DENIED: 409,
     DenyReason.FORBIDDEN: 403,
     DenyReason.RESOURCE_NOT_FOUND: 404,
 }
@@ -110,9 +112,10 @@ def create_app(service: AuthService | None = None) -> FastAPI:
 
     @app.post("/sessions/{session_id}/revoke")
     def revoke(session_id: str, token: str = Depends(bearer_token)) -> dict:
-        subject, _ = svc.active_session(token)
-        # 归属校验在服务层：他人会话 forbidden，会话不存在 401
-        info = svc.revoke_owned_session(subject, session_id)
+        subject, current_session_id = svc.active_session(token)
+        # 归属校验在服务层：他人会话 forbidden，会话不存在 401；
+        # 目标为当前会话时以 409 明确拒绝，不会误撤销自己
+        info = svc.revoke_owned_session(subject, session_id, current_session_id)
         return {"status": "revoked", "session": info.to_dict()}
 
     # ---- 会话安全审计 --------------------------------------------------

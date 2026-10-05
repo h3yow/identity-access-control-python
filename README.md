@@ -39,6 +39,11 @@
 - `POST /sessions/{session_id}/revoke`：撤销**自己的**某个会话；
   撤销后仅该会话的访问令牌与整条刷新链路立即失效，其他会话不受影响。
   会话不存在返回 `session_not_found`，会话属于他人返回 `forbidden`。
+  **不允许撤销当前会话**（由本次请求的 Bearer 令牌确定）：此类请求在
+  触碰任何状态之前被拒绝，返回 HTTP `409` + `current_session_revoke_denied`，
+  并写入一条 `denied:current_session_revoke_denied` 审计记录。被拒绝的请求
+  不留任何副作用——当前访问令牌、整条刷新链路、名下其他会话均保持可用，
+  会话列表如实反映真实状态。如需退出当前会话请使用 `POST /logout`。
 - `POST /sessions/revoke-others`：撤销除**当前会话**外的其他有效会话。
   当前会话由 Bearer 令牌确定，固定保留，因此不可能被误撤销。
 
@@ -117,6 +122,7 @@
 | `refresh_token_reused` | 401 | 刷新令牌重放，会话族已撤销 |
 | `session_not_found` | 401 | 会话不存在 |
 | `session_limit_reached` | 409 | 并发会话数达到上限，明确拒绝（不挤掉旧会话） |
+| `current_session_revoke_denied` | 409 | 不允许撤销当前会话（无任何副作用，请改用登出） |
 | `forbidden` | 403 | 已认证但缺少权限（含跨用户操作，不泄漏资源存在性） |
 | `resource_not_found` | 404 | 授权通过但资源不存在 |
 
@@ -169,6 +175,11 @@ curl -s -X POST localhost:8000/sessions/<session_id>/revoke \
 curl -s -X POST localhost:8000/sessions/revoke-others \
   -H "Authorization: Bearer <access_token>"
 
+# 撤销当前会话会被明确拒绝（409 current_session_revoke_denied），
+# 且当前令牌、刷新链路与其他会话均不受影响；退出当前会话请用 /logout
+curl -s -X POST localhost:8000/sessions/<当前会话的session_id>/revoke \
+  -H "Authorization: Bearer <当前会话的access_token>"
+
 # 查询审计（普通用户只能查自己；具备 audit:read 可带 subject 查全部）
 curl -s "localhost:8000/audit?action=login&limit=20&offset=0" \
   -H "Authorization: Bearer <access_token>"
@@ -185,5 +196,6 @@ curl -s -X POST localhost:8000/refresh -H 'content-type: application/json' \
 登出 / 撤销 / 密钥轮换后继续使用、权限调整立即生效、越权不泄漏资源存在性、
 各类失败原因可区分；以及新增的**并发登录触及容量上限（40 线程最终不超过 5）**、
 设备说明与会话列表字段、单会话撤销的隔离性、批量撤销只影响其他会话且保留当前、
+**撤销当前会话被 409 拒绝且拒绝后访问令牌 / 刷新链路 / 其他会话全部不受影响**、
 审计并发写入（16×200 条不丢不重、序号连续）、审计容量 FIFO 淘汰、
 分页与按主体/动作/时间过滤稳定排序、普通用户跨用户撤销或查询审计被拒绝。

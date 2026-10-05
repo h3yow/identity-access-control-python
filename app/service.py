@@ -212,8 +212,24 @@ class AuthService:
         session = self.sessions.require_active(payload.session_id)
         return session.subject, session.session_id
 
-    def revoke_owned_session(self, subject: str, session_id: str) -> SessionInfo:
-        """自助撤销：归属校验 + 审计，返回被撤销会话视图。"""
+    def revoke_owned_session(self, subject: str, session_id: str,
+                             current_session_id: str | None = None) -> SessionInfo:
+        """自助撤销：归属校验 + 审计，返回被撤销会话视图。
+
+        当前会话（由本次请求的访问令牌确定）不允许通过此入口撤销：
+        在触碰任何状态之前拒绝，保证被拒绝的请求不留副作用。
+        """
+        if current_session_id is not None and session_id == current_session_id:
+            self.audit.append(
+                subject, AuditAction.SESSION_REVOKE,
+                f"denied:{DenyReason.CURRENT_SESSION_REVOKE_DENIED.value}",
+                session_id=session_id,
+                detail="不允许撤销当前会话，请使用登出",
+            )
+            raise AuthError(
+                DenyReason.CURRENT_SESSION_REVOKE_DENIED,
+                "不允许撤销当前会话；如需退出请使用登出",
+            )
         info = self.sessions.revoke_owned(subject, session_id)
         self.audit.append(
             subject, AuditAction.SESSION_REVOKE, "success",
