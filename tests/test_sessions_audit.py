@@ -5,7 +5,9 @@
 - 并发登录触及容量上限：最终有效数不超限、成败结果与最终状态一致、
   被拒登录不留下可用令牌
 - 单会话撤销只影响目标；批量撤销只影响其他会话、当前会话保留
-- 跨用户撤销 / 查询审计被拒绝
+- 撤销当前会话被可区分拒绝（current_session_revoke_denied）且无任何副作用：
+  当前访问令牌、刷新链路、其他会话与会话列表均保持原样
+- 跨用户撤销 / 撤销不存在的会话 / 查询审计被拒绝
 - 审计并发写入不丢不重、分页稳定排序、容量上限淘汰最旧记录
 - 各类动作（登录/刷新/登出/撤销/批量/异常终止/密钥轮换/角色调整）均有记录
 """
@@ -227,6 +229,78 @@ def test_cross_user_revoke_is_forbidden(svc: AuthService) -> None:
                          Permission("document", "read")) == "alice"
 
 
+# ------------------------------------------------------------ 当前会话撤销保护
+
+def test_revoke_current_session_is_denied_without_side_effects(svc: AuthService) -> None:
+    """撤销当前会话必须被可区分地拒绝，且当前令牌、刷新链路、其他会话均不受影响。"""
+    current = svc.login("alice", ["reader"], device_label="current")
+    other = svc.login("alice", ["reader"], device_label="other")
+    before = [i.session_id for i in svc.list_sessions("alice")]
+
+    with pytest.raises(AuthError) as ei:
+        svc.revoke_owned_session("alice", current.session_id,
+                                 current_session_id=current.session_id)
+    log.info("撤销当前会话拒绝原因: %s", ei.value.reason.value)
+    assert ei.value.reason is DenyReason.CURRENT_SESSION_REVOKE
+
+    # 无副作用：当前访问令牌仍可用
+    assert svc.authorize(current.access_token,
+                         Permission("document", "read")) == "alice"
+    # 当前会话整条刷新链路仍可用
+    rotated = svc.refresh(current.refresh_token)
+    assert rotated.session_id == current.session_id
+    assert svc.authorize(rotated.access_token,
+                         Permission("document", "read")) == "alice"
+    # 其他会话不被连带失效
+    assert svc.authorize(other.access_token,
+                         Permission("document", "read")) == "alice"
+    # 会话列表如实反映：两个会话都仍是 active
+    after = svc.list_sessions("alice")
+    assert [i.session_id for i in after] == before
+    assert all(i.status.value == "active" for i in after)
+    # 拒绝本身留有审计记录
+    records = svc.audit.query(subject="alice",
+                              actions={AuditAction.SESSION_REVOKE}, limit=100).items
+    assert any(r.result == f"denied:{DenyReason.CURRENT_SESSION_REVOKE.value}"
+               and r.session_id == current.session_id for r in records)
+
+
+def test_revoke_other_session_with_current_context_still_works(svc: AuthService) -> None:
+    """带上当前会话标识去撤销其他会话：正常生效且不影响当前会话。"""
+    current = svc.login("alice", ["reader"], device_label="current")
+    other = svc.login("alice", ["reader"], device_label="other")
+
+    info = svc.revoke_owned_session("alice", other.session_id,
+                                    current_session_id=current.session_id)
+    assert info.session_id == other.session_id
+    assert info.status.value == "revoked"
+
+    # 被撤销会话的访问令牌与刷新链路失效
+    with pytest.raises(AuthError) as ei:
+        svc.authorize(other.access_token, Permission("document", "read"))
+    assert ei.value.reason is DenyReason.TOKEN_REVOKED
+    with pytest.raises(AuthError) as ei:
+        svc.refresh(other.refresh_token)
+    assert ei.value.reason is DenyReason.TOKEN_REVOKED
+    # 当前会话及其刷新链路不受影响
+    assert svc.authorize(current.access_token,
+                         Permission("document", "read")) == "alice"
+    assert svc.refresh(current.refresh_token).session_id == current.session_id
+    assert [i.session_id for i in svc.list_sessions("alice")] == [current.session_id]
+
+
+def test_revoke_nonexistent_session_still_denied(svc: AuthService) -> None:
+    current = svc.login("alice", ["reader"])
+    with pytest.raises(AuthError) as ei:
+        svc.revoke_owned_session("alice", "no-such-session",
+                                 current_session_id=current.session_id)
+    log.info("撤销不存在会话拒绝原因: %s", ei.value.reason.value)
+    assert ei.value.reason is DenyReason.SESSION_NOT_FOUND
+    # 当前会话不受影响
+    assert svc.authorize(current.access_token,
+                         Permission("document", "read")) == "alice"
+
+
 # ------------------------------------------------------------ 审计记录内容
 
 def test_all_security_actions_are_audited(svc: AuthService, clock: Clock) -> None:
@@ -367,6 +441,60 @@ def test_normal_user_cannot_query_others_audit(svc: AuthService) -> None:
 
 
 # ------------------------------------------------------------ HTTP 层
+
+def test_http_revoke_current_session_denied_and_state_consistent(svc: AuthService) -> None:
+    """HTTP 端到端：撤销当前会话被 409 拒绝，且当前令牌/刷新链路/会话列表全部保持一致。"""
+    client = TestClient(create_app(svc))
+
+    def login(subject, roles, label=None):
+        body = {"subject": subject, "roles": roles}
+        if label is not None:
+            body["device_label"] = label
+        r = client.post("/login", json=body)
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    current = login("alice", ["reader"], "current")
+    other = login("alice", ["reader"], "other")
+    h = {"Authorization": f"Bearer {current['access_token']}"}
+
+    # 撤销当前会话 -> 409，原因稳定可区分
+    r = client.post(f"/sessions/{current['session_id']}/revoke", headers=h)
+    log.info("HTTP 撤销当前会话: status=%d body=%s", r.status_code, r.json())
+    assert r.status_code == 409
+    assert r.json()["error"] == "current_session_revoke_denied"
+
+    # 无副作用：同一访问令牌访问受保护资源仍然 200
+    r = client.get("/resources/doc-1", headers=h)
+    assert r.status_code == 200 and r.json()["subject"] == "alice"
+    # 刷新链路仍然可用
+    r = client.post("/refresh", json={"refresh_token": current["refresh_token"]})
+    assert r.status_code == 200 and r.json()["session_id"] == current["session_id"]
+    # 会话列表如实反映：两个会话都仍 active
+    listed = client.get("/sessions", headers=h).json()["sessions"]
+    assert {s["session_id"] for s in listed} == {current["session_id"], other["session_id"]}
+    assert all(s["status"] == "active" for s in listed)
+
+    # 撤销自己的其他会话 -> 200 生效，当前会话不受影响
+    r = client.post(f"/sessions/{other['session_id']}/revoke", headers=h)
+    assert r.status_code == 200 and r.json()["session"]["status"] == "revoked"
+    assert client.get("/resources/doc-1", headers=h).status_code == 200
+    oh = {"Authorization": f"Bearer {other['access_token']}"}
+    assert client.get("/resources/doc-1", headers=oh).status_code == 401
+    listed = client.get("/sessions", headers=h).json()["sessions"]
+    assert [s["session_id"] for s in listed] == [current["session_id"]]
+
+    # 撤销不存在的会话 -> 401 session_not_found（可区分）
+    r = client.post("/sessions/no-such-session/revoke", headers=h)
+    assert r.status_code == 401 and r.json()["error"] == "session_not_found"
+
+    # 撤销他人会话 -> 403 forbidden，且目标会话不被波及（不泄漏、不失效）
+    bob = login("bob", ["reader"], "bob-dev")
+    r = client.post(f"/sessions/{bob['session_id']}/revoke", headers=h)
+    assert r.status_code == 403 and r.json()["error"] == "forbidden"
+    bh = {"Authorization": f"Bearer {bob['access_token']}"}
+    assert client.get("/resources/doc-1", headers=bh).status_code == 200
+
 
 def test_http_session_and_audit_flows(svc: AuthService) -> None:
     client = TestClient(create_app(svc))
